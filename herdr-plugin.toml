@@ -1,25 +1,24 @@
-id = "floor.desktopbridge"
-name = "Desktop Floor Bridge"
-version = "0.1.0"
+id = "floor.mcpbridge"
+name = "herdr floor MCP bridge"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
-description = "A stdio MCP server that lets Claude Desktop read a herdr floor and leave it messages. Mailbox and doorbell only, never a conductor seat."
+description = "A stdio MCP server that lets any MCP client (Claude Desktop, Grok, others) read a herdr floor and leave it messages. Mailbox and doorbell only, never a seat at the floor."
 platforms = ["macos", "linux"]
 
 # NO [[startup]] and NO [[events]], on purpose.
 #
-# This plugin owns no background work. The MCP server is launched by Claude
-# Desktop as a subprocess, not by herdr, so there is nothing for herdr to run
-# at startup and nothing to react to. A startup hook here would be a process
-# that exists only to be forgotten about, and an event hook would spawn a
-# process per event for no gain (`pane.updated` alone runs at roughly 5
-# events/second on a busy floor).
+# This plugin owns no background work. The MCP server is launched by the MCP
+# client as a subprocess, not by herdr, so there is nothing for herdr to run at
+# startup and nothing to react to. A startup hook here would be a process that
+# exists only to be forgotten about, and an event hook would spawn a process
+# per event for no gain.
 #
 # The one action below is operator invoked and read only. It answers the only
-# question this plugin has at runtime: can the bridge see the socket, and what
+# question this plugin has at runtime: can the bridge see the floor, and what
 # is it currently willing to prompt.
 
 [[actions]]
 id = "check"
-title = "Check the Desktop bridge (socket, allow list, mount snippet)"
+title = "Check the MCP bridge (floor reachable, allow list, server entry)"
 contexts = ["workspace"]
 command = ["python3", "bin/check.py"]
