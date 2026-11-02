@@ -48,6 +48,8 @@ def scenario(backend: str, tmp: Path) -> None:
         "HERDR_BRIDGE_BACKEND": backend,
         "HERDR_BRIDGE_BIN": str(fakes[backend]),
         "HERDR_BRIDGE_INBOX_DIR": str(inbox),
+        "HERDR_BRIDGE_AUDIT_LOG": str(tmp / f"{backend}-audit.log"),
+        "HERDR_BRIDGE_READ_ALLOW": "conductor-one,reviewer-one",
         "FAKE_LOG": str(log),
     }
     first = "conductor-one" if backend == "herdr" else "reviewer-one"

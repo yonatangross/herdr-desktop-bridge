@@ -32,7 +32,7 @@ So the surface is chosen so that the worst case is noise, not damage.
 | Tool | Kind | What it can do | Backends |
 |---|---|---|---|
 | `floor_status` | read | one line per agent or terminal: name, status, where | both |
-| `floor_read` | read | recent output of one named agent or terminal | both |
+| `floor_read` | read | recent output of one agent or terminal named exactly in `HERDR_BRIDGE_READ_ALLOW` | both |
 | `floor_prompt` | write | submit text to one agent, target gated twice | both |
 | `floor_inbox` | write | one markdown file in the inbox directory | both |
 | `floor_notify` | write | one native herdr notification | herdr only |
@@ -80,6 +80,26 @@ Name role seats here (a seat whose job is to receive briefs), not worker lanes
 in the middle of a task. `*` is legal and means "any structurally valid name";
 that is the operator's call, and gate 1 still holds.
 
+### Read gate: `HERDR_BRIDGE_READ_ALLOW` (operator configurable)
+
+`floor_read` hands a terminal's output to the client's model, which for Grok
+and other third-party clients is an outside model. So reading is default-deny:
+
+- A comma separated list of **exact** seat names. No globs, no prefixes, no
+  case folding: `conductor` does not admit `conductor-one`, and `*` admits
+  nothing. A new or similarly named terminal stays denied until it is named.
+- **Unset or empty refuses every read.**
+- **Fails closed.** Any error inside the access check is a denial.
+- **Every denied read is logged** as one JSON line (`ts`, `client`, `target`,
+  `reason`) to `HERDR_BRIDGE_AUDIT_LOG` (default `~/.herdr-bridge/audit.log`).
+  A log that cannot be written never turns a denial into an allow.
+
+```
+HERDR_BRIDGE_READ_ALLOW="conductor,release-seat"
+```
+
+Never list a client desk or a private lane here.
+
 On the `hc` backend the prompt is sent without `--force`, so a terminal that is
 parked on a dialog is refused by hc itself. A prompt from the chat window can
 never answer a permission question by accident.
@@ -114,7 +134,8 @@ Add this to `claude_desktop_config.json`, then restart Desktop:
       "args": ["/path/to/herdr-desktop-bridge/bin/herdr_floor_mcp.py"],
       "env": {
         "HERDR_BRIDGE_BACKEND": "hc",
-        "HERDR_BRIDGE_PROMPT_ALLOW": "conductor,*-desk"
+        "HERDR_BRIDGE_PROMPT_ALLOW": "conductor,*-desk",
+        "HERDR_BRIDGE_READ_ALLOW": "conductor"
       }
     }
   }
@@ -154,6 +175,8 @@ local binary.
 | `HERDR_BRIDGE_BACKEND` | `herdr` | `herdr` or `hc` |
 | `HERDR_BRIDGE_BIN` | `herdr` or `hc` | absolute path when the binary is not on the client's `PATH` |
 | `HERDR_BRIDGE_PROMPT_ALLOW` | empty (refuse all) | comma separated globs of promptable names |
+| `HERDR_BRIDGE_READ_ALLOW` | empty (refuse all) | comma separated EXACT names `floor_read` may return |
+| `HERDR_BRIDGE_AUDIT_LOG` | `~/.herdr-bridge/audit.log` | one JSON line per denied read |
 | `HERDR_BRIDGE_INBOX_DIR` | `~/.herdr-bridge/inbox` | where `floor_inbox` writes |
 | `HERDR_BRIDGE_CLIENT_NAME` | the client's `clientInfo.name` | sender label in inbox notes |
 
@@ -207,15 +230,20 @@ wish.
 3. **Prompts are refused until the operator allows them.** Unset allow list,
    refused, nothing reaches the binary.
    *Fails as:* a fresh install that can type into any agent.
-4. **The mailbox touches no backend.** The inbox test asserts no argv log.
-5. **The tool set is exact per backend.** Five on herdr, four on hc, asserted as
+4. **Reads are refused until the operator names the seat, exactly.** Unset
+   list, an unlisted seat, a prefix, a glob and a different case are all
+   refused before the binary runs; an error in the check denies; each denial
+   writes one audit line.
+   *Fails as:* a third-party model reading a client desk or a private lane.
+5. **The mailbox touches no backend.** The inbox test asserts no argv log.
+6. **The tool set is exact per backend.** Five on herdr, four on hc, asserted as
    sets, plus a negative check that no run, exec, key or close tool exists.
-6. **Bad input is a JSON-RPC error, never a crash.** Unknown tool `-32602`,
+7. **Bad input is a JSON-RPC error, never a crash.** Unknown tool `-32602`,
    unknown method `-32601`, the process still exits 0. Only JSON-RPC goes to
    stdout; the startup banner goes to stderr.
-7. **The smoke test can fail.** Breaking the hc prompt argv, or opening gate 2,
+8. **The smoke test can fail.** Breaking the hc prompt argv, or opening gate 2,
    turns it red (checked by hand with mutated copies before release).
-8. **The repo carries no private data.** `scripts/scrub.sh` runs every pattern
+9. **The repo carries no private data.** `scripts/scrub.sh` runs every pattern
    against a planted control first, then scans. Patterns that would themselves
    leak (your names, handles, customer list) live in files outside the repo,
    named by `SCRUB_PRIVATE_PATTERNS` and `SCRUB_CLIENTS_DIR`. A skipped check

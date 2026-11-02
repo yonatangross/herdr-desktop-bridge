@@ -13,7 +13,8 @@ Two backends, picked by HERDR_BRIDGE_BACKEND:
 
 Surface, deliberately small (a full CLI proxy was considered and rejected):
   floor_status   read   every agent or terminal on the floor, condensed
-  floor_read     read   recent output of one named agent or terminal
+  floor_read     read   recent output of one agent or terminal; the name must
+                        be listed EXACTLY in HERDR_BRIDGE_READ_ALLOW
   floor_prompt   write  submit text to one agent; the target must pass BOTH
                         the structural name gate and HERDR_BRIDGE_PROMPT_ALLOW
   floor_inbox    write  one markdown file in the inbox directory, the mailbox
@@ -34,6 +35,10 @@ Environment (see .env.example):
   HERDR_BRIDGE_BIN            backend binary, default `herdr` or `hc`
   HERDR_BRIDGE_PROMPT_ALLOW   comma separated fnmatch globs of promptable
                               names; empty or unset refuses every target
+  HERDR_BRIDGE_READ_ALLOW     comma separated EXACT names floor_read may
+                              return; no globs; empty or unset refuses all
+  HERDR_BRIDGE_AUDIT_LOG      JSON lines of denied reads, default
+                              ~/.herdr-bridge/audit.log
   HERDR_BRIDGE_INBOX_DIR      mailbox directory, default ~/.herdr-bridge/inbox
   HERDR_BRIDGE_CLIENT_NAME    sender label in inbox files; default is the
                               clientInfo.name the client sent on initialize
@@ -84,6 +89,56 @@ class ToolError(Exception):
 def prompt_allow_patterns() -> list[str]:
     raw = os.environ.get("HERDR_BRIDGE_PROMPT_ALLOW", "")
     return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def read_allow_names() -> list[str]:
+    """Seats floor_read may return, as EXACT names. Empty or unset denies all.
+
+    Read output goes to a third-party model, so this is default-deny and exact
+    match only: no globs, no prefixes, no case folding. A new or similarly
+    named terminal stays denied until the operator names it here.
+    """
+    raw = os.environ.get("HERDR_BRIDGE_READ_ALLOW", "")
+    return [n.strip() for n in raw.split(",") if n.strip()]
+
+
+def audit_log_path() -> Path:
+    return Path(
+        os.environ.get("HERDR_BRIDGE_AUDIT_LOG", "").strip()
+        or str(Path.home() / ".herdr-bridge" / "audit.log")
+    )
+
+
+def _audit_denied_read(target: str, reason: str) -> None:
+    """One JSON line per denied read. Never raises: a broken log still denies."""
+    row = {
+        "ts": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "event": "read_denied",
+        "client": client_name(),
+        "target": target,
+        "reason": reason,
+    }
+    try:
+        path = audit_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception as exc:  # noqa: BLE001 - auditing must never open the gate
+        sys.stderr.write(f"herdr-floor: audit write failed ({type(exc).__name__})\n")
+        sys.stderr.flush()
+
+
+def _read_allowed(name: str) -> tuple[bool, str]:
+    """(allowed, reason). Fails closed: any error in the check is a denial."""
+    try:
+        names = read_allow_names()
+        if not names:
+            return False, "allow_empty"
+        if any(name == allowed for allowed in names):
+            return True, "listed"
+        return False, "not_listed"
+    except Exception:  # noqa: BLE001 - fail closed, never open on error
+        return False, "check_error"
 
 
 def client_name() -> str:
@@ -208,6 +263,21 @@ def tool_floor_read(args: dict) -> str:
             "agent must be a name or address exactly as floor_status prints it "
             "([a-z0-9][a-z0-9-]{0,63})"
         )
+    allowed, reason = _read_allowed(name)
+    if not allowed:
+        _audit_denied_read(name, reason)
+        if reason == "allow_empty":
+            raise ToolError(
+                f"read of {name!r} refused: HERDR_BRIDGE_READ_ALLOW is empty, so no "
+                "terminal is readable. The operator names each readable seat there, "
+                "exactly, in the client's MCP server env."
+            )
+        if reason == "check_error":
+            raise ToolError(f"read of {name!r} refused: the access check failed, so it denies.")
+        raise ToolError(
+            f"read of {name!r} refused: it is not on HERDR_BRIDGE_READ_ALLOW "
+            "(exact names only, no wildcards)."
+        )
     lines = max(10, min(400, int(args.get("lines", 80))))
     text = _hc_read(name, lines) if BACKEND == "hc" else _herdr_read(name, lines)
     if len(text) > READ_CAP:
@@ -288,7 +358,9 @@ TOOL_SPECS = {
     },
     "floor_read": {
         "description": (
-            "Recent terminal output of one agent or terminal. Read only. Output over "
+            "Recent terminal output of one agent or terminal. Read only. The name must "
+            "be listed exactly in the operator's HERDR_BRIDGE_READ_ALLOW; anything else "
+            "is refused before the backend runs. Output over "
             f"{READ_CAP} characters is cut to the newest part with a notice."
         ),
         "inputSchema": {
@@ -466,7 +538,8 @@ def main() -> int:
     # The banner goes to stderr: stdout carries only JSON-RPC.
     sys.stderr.write(
         f"herdr-floor {VERSION} backend={BACKEND} bin={BIN} "
-        f"tools={len(BACKEND_TOOLS[BACKEND])} prompt_allow={len(prompt_allow_patterns())}\n"
+        f"tools={len(BACKEND_TOOLS[BACKEND])} prompt_allow={len(prompt_allow_patterns())} "
+        f"read_allow={len(read_allow_names())}\n"
     )
     sys.stderr.flush()
     for raw in sys.stdin:

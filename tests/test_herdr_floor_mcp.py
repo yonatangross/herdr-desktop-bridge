@@ -39,12 +39,14 @@ def bridge(tmp_path: Path, backend: str):
     fakes = install_fakes(tmp_path / "bin")
     log = tmp_path / "argv.log"
     inbox = tmp_path / "inbox"
+    audit = tmp_path / "audit.log"
 
     def call(messages, env=None, client="test-client"):
         base = {
             "HERDR_BRIDGE_BACKEND": backend,
             "HERDR_BRIDGE_BIN": str(fakes[backend]),
             "HERDR_BRIDGE_INBOX_DIR": str(inbox),
+            "HERDR_BRIDGE_AUDIT_LOG": str(audit),
             "FAKE_LOG": str(log),
         }
         out, err, rc = run_server(
@@ -56,6 +58,7 @@ def bridge(tmp_path: Path, backend: str):
 
     call.log = log  # type: ignore[attr-defined]
     call.inbox = inbox  # type: ignore[attr-defined]
+    call.audit = audit  # type: ignore[attr-defined]
     call.backend = backend  # type: ignore[attr-defined]
     return call
 
@@ -98,7 +101,10 @@ def test_status_condenses_the_floor(bridge):
 
 
 def test_read_reaches_the_backend_with_the_expected_argv(bridge):
-    out = bridge([tool(1, "floor_read", agent="conductor-one", lines=40)])
+    out = bridge(
+        [tool(1, "floor_read", agent="conductor-one", lines=40)],
+        env={"HERDR_BRIDGE_READ_ALLOW": "conductor-one"},
+    )
     assert out[1]["result"]["isError"] is False
     if bridge.backend == "herdr":
         assert text_of(out[1]) == "FAKE-herdr-screen-4d1c"
@@ -237,6 +243,8 @@ def test_hc_read_is_truncated_with_a_notice(tmp_path):
             "HERDR_BRIDGE_BIN": str(fakes["hc"]),
             "FAKE_LOG": str(tmp_path / "log"),
             "FAKE_BIG": "1",
+            "HERDR_BRIDGE_READ_ALLOW": "t7",
+            "HERDR_BRIDGE_AUDIT_LOG": str(tmp_path / "audit.log"),
         },
     )
     assert rc == 0, err
@@ -261,3 +269,120 @@ def test_banner_goes_to_stderr_with_the_tool_count(tmp_path):
     assert rc == 0
     assert "herdr-floor 0.2.0 backend=hc" in err and "tools=4" in err
     assert list(out) == [0], "stdout carries only JSON-RPC"
+
+
+# ---------------------------------------------------------------- read gate
+# floor_read hands a terminal's output to a third-party model (Grok and other
+# MCP clients), so client text and private lanes must not leave by default.
+# HERDR_BRIDGE_READ_ALLOW is a default-deny list of EXACT seat names.
+
+
+def _audit_rows(bridge) -> list[dict]:
+    import json
+
+    if not bridge.audit.exists():
+        return []
+    return [json.loads(line) for line in bridge.audit.read_text().splitlines() if line]
+
+
+def test_read_is_refused_by_default_before_touching_the_backend(bridge):
+    out = bridge([tool(1, "floor_read", agent="conductor-one")])
+    assert out[1]["result"]["isError"] is True
+    assert "HERDR_BRIDGE_READ_ALLOW is empty" in text_of(out[1])
+    assert not bridge.log.exists(), "a refused read must never reach the backend binary"
+
+
+def test_an_unlisted_seat_is_refused(bridge):
+    out = bridge(
+        [tool(1, "floor_read", agent="private-lane")],
+        env={"HERDR_BRIDGE_READ_ALLOW": "conductor-one,release-seat"},
+    )
+    assert out[1]["result"]["isError"] is True
+    assert "not on HERDR_BRIDGE_READ_ALLOW" in text_of(out[1])
+    assert not bridge.log.exists()
+
+
+@pytest.mark.parametrize(
+    "allow,target",
+    [
+        ("conductor", "conductor-one"),  # a prefix is not a match
+        ("conductor-one", "conductor-one-b"),  # a longer, similar name
+        ("conductor*", "conductor-one"),  # a glob is not a wildcard here
+        ("*", "conductor-one"),
+        ("t1?", "t10"),
+        ("[a-z]*", "client-x"),
+        ("Conductor-One", "conductor-one"),  # case is exact too
+    ],
+)
+def test_only_an_exact_name_matches(bridge, allow, target):
+    out = bridge(
+        [tool(1, "floor_read", agent=target)],
+        env={"HERDR_BRIDGE_READ_ALLOW": allow},
+    )
+    assert out[1]["result"]["isError"] is True, f"{allow!r} must not admit {target!r}"
+    assert not bridge.log.exists()
+
+
+def test_each_listed_seat_is_readable(bridge):
+    out = bridge(
+        [
+            tool(1, "floor_read", agent="conductor-one"),
+            tool(2, "floor_read", agent="release-seat"),
+        ],
+        env={"HERDR_BRIDGE_READ_ALLOW": " conductor-one , release-seat "},
+    )
+    assert out[1]["result"]["isError"] is False
+    assert out[2]["result"]["isError"] is False
+    assert _audit_rows(bridge) == [], "an allowed read is not a denied read"
+
+
+def test_every_denied_read_writes_one_audit_line(bridge):
+    out = bridge(
+        [
+            tool(1, "floor_read", agent="private-lane"),
+            tool(2, "floor_read", agent="conductor-one"),
+            tool(3, "floor_read", agent="client-desk"),
+        ],
+        env={"HERDR_BRIDGE_READ_ALLOW": "conductor-one"},
+        client="Grok Desktop",
+    )
+    assert [out[i]["result"]["isError"] for i in (1, 2, 3)] == [True, False, True]
+    rows = _audit_rows(bridge)
+    assert [r["target"] for r in rows] == ["private-lane", "client-desk"]
+    for row in rows:
+        assert row["event"] == "read_denied"
+        assert row["client"] == "Grok Desktop"
+        assert row["reason"] == "not_listed"
+        assert row["ts"].endswith("Z") and "T" in row["ts"]
+
+
+def test_a_denied_read_still_denies_when_the_audit_log_cannot_be_written(bridge, tmp_path):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    out = bridge(
+        [tool(1, "floor_read", agent="private-lane")],
+        env={"HERDR_BRIDGE_AUDIT_LOG": str(blocker / "audit.log")},
+    )
+    assert out[1]["result"]["isError"] is True
+    assert not bridge.log.exists()
+
+
+def test_the_access_check_fails_closed(monkeypatch):
+    """Any error inside the check is a denial, never an open door."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
+    import herdr_floor_mcp as bridge_mod
+
+    def boom() -> list[str]:
+        raise RuntimeError("allow list unreadable")
+
+    def must_not_run(*_args):
+        raise AssertionError("the backend must not be called on a failed check")
+
+    monkeypatch.setenv("HERDR_BRIDGE_READ_ALLOW", "conductor-one")
+    monkeypatch.setenv("HERDR_BRIDGE_AUDIT_LOG", "/dev/null")
+    monkeypatch.setattr(bridge_mod, "read_allow_names", boom)
+    monkeypatch.setattr(bridge_mod, "_herdr_read", must_not_run)
+    monkeypatch.setattr(bridge_mod, "_hc_read", must_not_run)
+    with pytest.raises(bridge_mod.ToolError) as exc:
+        bridge_mod.tool_floor_read({"agent": "conductor-one"})
+    assert "access check failed" in str(exc.value)
